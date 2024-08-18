@@ -1,75 +1,84 @@
 use notify::{EventHandler, EventKind, RecursiveMode, Watcher};
-use std::io;
+use std::env;
 use std::path::Path;
 use std::error::Error;
 use std::fs::create_dir;
-use std::sync::mpsc::{Sender, Receiver, SendError, RecvTimeoutError, channel};
+use std::sync::mpsc::{Sender, Receiver, SendError};
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use crate::common::{
     message::Message, 
-    data::{Index, FileData}, 
-    util::{hash_path, create_file_data, find_relative_path}
+    data::{Index, FileData, Change, ChangeType}, 
+    util::{hash_path, create_file_data, find_relative_path, as_nanos_since_epoch}
 };
 
 use super::error::IllegalState;
+use super::util::index_from_dir;
 
-
-fn init(dovetail_dir: &Path) -> Result<Index, Box<dyn Error>> {
+fn init_dovetail(dir: &Path) -> Result<Index, Box<dyn Error>> {
+    let dovetail_dir = &dir.join(".rdovetail");
     let dovetail_initialized = dovetail_dir.try_exists().unwrap_or_else(|_| {
         false
     });
-    let mut index: Option<Index> = None;
-    if !dovetail_initialized {
-        create_dir(dovetail_dir)?;  
-        index = Some(Index::new());
-    }
-    let index: Index = match index {
-        Some(value) => value,
-        None => Index::from_file(&dovetail_dir.join("index")),
+    let index = {
+        if !dovetail_initialized {
+            create_dir(dovetail_dir)?;  
+            let temp = Index::new(dir.to_path_buf());
+            let arc_temp = Arc::new(Mutex::new(temp));
+            index_from_dir(&dir.to_path_buf(), Arc::clone(&arc_temp))?;
+            let mtx = Arc::try_unwrap(arc_temp).unwrap();
+            let index = mtx.into_inner().unwrap();
+            index.write_to_file()?;
+            index
+        } else {
+            Index::from_file(&dovetail_dir.join("index"))?
+        }
     };
     Ok(index)
 }
 
 pub fn start(
-    tx_to_client: Sender<Message>, 
-    rx_from_client: Receiver<Message>,
-    tx_from_client_clone: Sender<Message>,
+    tx_alpha: Sender<Message>, 
+    rx_beta: Receiver<Message>,
+    tx_beta_clone: Sender<Message>,
     ) -> Result<(), Box<dyn Error>> { 
-    let path = Path::new(".");
-    let dovetail_dir = &path.join(".rdovetail");
+    let path = env::current_dir()?;
 
-    let index = init(&dovetail_dir)?;
+    let index = init_dovetail(&path)?;
     // Check entire directory, and ensure that index is up to date
 
-    // Swap out VersionControl with a separate handler. This handler will have a transmitter to
-    // request changes to index. THe transmitter will be cloned, and used in the loop below. Both
-    // the client file and handler can request changes to the index, with a first come first serve
-    // basis. 
     let mut watcher = notify::recommended_watcher(
         ChangeNotifier {
-            tx: tx_from_client_clone,
-        })?;
+            tx: tx_beta_clone,
+    })?;
 
     let mut vcs = VersionControl {
         index,
-        rx_from_client,
-        tx_to_client,
+        rx_updates: rx_beta,
+        tx_to_client: tx_alpha,
+        changes: Vec::new(),
     };
 
     // Add a path to be watched. All files and directories at that path and
     // below will be monitored for changes.
     watcher.watch(&path, RecursiveMode::Recursive)?;
 
+    println!("Started listening.");
     loop {
         vcs.listen();
     }
     Ok(())
 }
 
+// VCS should have some sort of data structure that can aid in determining if a file has been
+// deleted.
+
 struct VersionControl {
     index: Index,
-    rx_from_client: Receiver<Message>,
+    rx_updates: Receiver<Message>,
     tx_to_client: Sender<Message>,
+    changes: Vec<Change>,
 }
 
 impl VersionControl {
@@ -79,12 +88,22 @@ impl VersionControl {
     }
 
     fn listen(&mut self) {
-        match self.rx_from_client.recv() {
+        match self.rx_updates.recv() {
             Ok(message) => {
                 match message {
                     Message::FileCreated { path } => {
                         println!("Created: {:?}", path);
-                        if let Ok(_) = self.add_file_data(&path) {
+                        
+                        if let Ok(key) = self.add_file_data(&path) {
+                            let file_hash = self.index.get_file_data(&key).unwrap().get_hash();
+                            self.changes.push(Change {
+                                change_type: ChangeType::Create {
+                                    file_hash: *file_hash
+                                },
+                                new_state: self.index.get_current_state(),
+                                timestamp: as_nanos_since_epoch(&SystemTime::now()),
+                                file_path: path.clone(),
+                            });
                             if let Err(err) = self.send_update(Message::FileCreated { path }) {
                                 println!("Error: {:?}", err)
                                 //check_health
@@ -96,11 +115,21 @@ impl VersionControl {
                     Message::FileRemoved { path } => {
                         println!("Removed: {:?}", path);
                         if let Some(_) = self.remove_file_data(&path) {
+                            self.changes.push(Change {
+                                change_type: ChangeType::Delete,
+                                new_state: self.index.get_current_state(),
+                                timestamp: as_nanos_since_epoch(&SystemTime::now()),
+                                file_path: path.clone(),
+                            });
                             if let Err(err) = self.send_update(Message::FileRemoved { path }) {
                                 println!("Error: {:?}", err)
                                 //check_health
                             }
                         }
+                    },
+                    Message::FileRequest { relative_path_hash } => {
+
+
                     },
                 }
             },
@@ -108,7 +137,7 @@ impl VersionControl {
         }
     }
 
-    fn add_file_data(&mut self, path: &Path) -> Result<(), Box<dyn Error>> {
+    fn add_file_data(&mut self, path: &Path) -> Result<[u8; 32], Box<dyn Error>> {
         // Hashes content with filename
         let file_data = match create_file_data(
             self.index.get_path_to_dir().to_path_buf(), 
@@ -124,7 +153,7 @@ impl VersionControl {
 
         self.index.add_file_data(relative_path_hash, file_data)?;
         self.index.write_to_file()?;
-        Ok(())
+        Ok(relative_path_hash)
     }
 
     fn remove_file_data(&mut self, path: &Path) -> Option<FileData> {
@@ -136,6 +165,26 @@ impl VersionControl {
         let relative_path_hash = hash_path(&relative_path);
         self.index.remove_file_data(relative_path_hash)
     }
+
+    fn implement_change(&mut self, change: Change) {
+        match change.change_type {
+            ChangeType::Create { file_hash } => {
+                // Request file from original source
+                //
+
+            },
+            ChangeType::Delete => {
+                // Find the actual file and delete it
+                self.remove_file_data(&change.file_path);
+            },
+            ChangeType::Modify { file_hash } => {
+
+            },
+            ChangeType::Rename { new_name } => {
+
+            }
+        }
+    }
 }
 
 struct ChangeNotifier {
@@ -144,16 +193,10 @@ struct ChangeNotifier {
 
 impl ChangeNotifier {
     fn notify_vcs(&self, message: Message) {
-        self.tx.send(message);
+        let _ = self.tx.send(message);
     }
 }
 
-// Check if change happened in .rdovetail, ignore if thats the case - COMPLETE
-// Hash file - COMPLETE
-// Check if file hash is different from existing one
-// Add to index if not already there, update if it is
-// (Optional) Compress file
-// Sync with server
 impl EventHandler for ChangeNotifier {
     fn handle_event(&mut self, event: notify::Result<notify::Event>) {
         match event {

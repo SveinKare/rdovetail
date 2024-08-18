@@ -7,5 +7,8 @@ pub enum Message {
     FileRemoved {
         path: PathBuf,
     },
+    FileRequest {
+        relative_path_hash: [u8; 32],
+    },
 }
 

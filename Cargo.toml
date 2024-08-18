@@ -7,3 +7,4 @@ edition = "2021"
 clap = { version = "4.5.9", features = ["derive"] }
 notify = "6.1.1"
 sha2 = "0.10.8"
+memmap2 = "0.9.4"

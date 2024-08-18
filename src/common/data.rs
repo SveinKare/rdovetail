@@ -3,13 +3,17 @@ use std::path::{Path, PathBuf};
 use std::io::{self, Write};
 use std::collections::HashMap;
 use std::fs;
-use std::env;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::hash::Hash;
+use sha2::{Digest, Sha256};
 use crate::common::error::EntryConflict;
+use super::util::{as_nanos_since_epoch};
 
 #[derive(Debug)]
 pub struct FileData {
     hash: [u8; 32],
     path_from_root: Box<Path>,
+    timestamp: SystemTime,
 }
 
 impl FileData {
@@ -17,7 +21,12 @@ impl FileData {
         FileData {
             hash: [0; 32],
             path_from_root: Path::new(".").into(),
+            timestamp: UNIX_EPOCH,
         }
+    }
+
+    pub fn get_hash(&self) -> &[u8; 32] {
+        &self.hash
     }
 
     pub fn set_hash(&mut self, hash: [u8; 32]) {
@@ -30,6 +39,14 @@ impl FileData {
 
     pub fn set_path_from_root(&mut self, path: PathBuf) {
         self.path_from_root = path.into_boxed_path();
+    }
+
+    pub fn get_timestamp(&self) -> &SystemTime {
+        &self.timestamp
+    }
+
+    pub fn set_timestamp(&mut self, timestamp: SystemTime) {
+        self.timestamp = timestamp
     }
 
     fn serialize(&self) -> Vec<u8> {
@@ -49,7 +66,7 @@ impl FileData {
         path.pop();
         let path = path.as_bytes();
 
-        let data_length: u32 = (path.len() + 32).try_into().unwrap_or_else(|_| {
+        let data_length: u32 = (path.len() + 40).try_into().unwrap_or_else(|_| {
             panic!("Conversion from usize to u32 failed.");
         });
         let data_length = data_length.to_be_bytes();
@@ -66,15 +83,17 @@ impl FileData {
             bytes.push(byte);
         }
 
+        let nanos_since_epoch = as_nanos_since_epoch(&self.timestamp);
+        for byte in nanos_since_epoch.to_be_bytes() {
+            bytes.push(byte);
+        }
+
         bytes
     }
 
     fn deserialize(bytes: &[u8]) -> Self {
-        let mut hash: [u8; 32] = [0; 32];
-        hash.copy_from_slice(&bytes[bytes.len()-32..bytes.len()]);
-
-        let path = &bytes[0..bytes.len()-32];
-
+        // Last 48 bytes are hash and timestamp, everything up until that point is the path
+        let path = &bytes[0..bytes.len()-40];
         let path = match std::str::from_utf8(path) {
             Ok(path) => path,
             Err(err) => {
@@ -87,9 +106,20 @@ impl FileData {
         }
         let path_from_root: Box<Path> = path_from_root.into_boxed_path();
 
+        // SHA256 hash of the files content and filename
+        let mut hash: [u8; 32] = [0; 32];
+        hash.copy_from_slice(&bytes[bytes.len()-40..bytes.len()-8]);
+
+        // Last 8 bytes is the ms since epoch timestamp
+        let ms_since_epoch: [u8; 8] = bytes[bytes.len()-8..bytes.len()].try_into().unwrap();
+        let ms_since_epoch = u64::from_be_bytes(ms_since_epoch);
+        let ms_since_epoch = Duration::from_nanos(ms_since_epoch);
+        let timestamp = UNIX_EPOCH.checked_add(ms_since_epoch).unwrap();
+
         let file_data = FileData {
             hash,
             path_from_root,
+            timestamp,
         };
         file_data
     }
@@ -114,7 +144,9 @@ impl FileData {
 
 impl PartialEq for FileData {
     fn eq(&self, other: &Self) -> bool {
-        self.hash.eq(&other.hash) && self.path_from_root.eq(&other.path_from_root)
+        self.hash.eq(&other.hash) 
+            && self.path_from_root.eq(&other.path_from_root)
+            && self.timestamp.eq(&other.timestamp)
     }
 }
 
@@ -123,22 +155,31 @@ impl Clone for FileData {
         let mut copy = FileData::new();
         copy.hash.copy_from_slice(&self.hash);
         copy.path_from_root = self.path_from_root.clone();
+        copy.timestamp = self.timestamp.clone();
         copy
     }
-
 }
 
+#[derive(Eq, PartialEq, Debug)]
+struct SHA256Hash {
+    value: [u8; 32],
+}
+
+impl Hash for SHA256Hash {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write(&self.value);
+    }
+}
+
+/// An overview of the currently tracked files in the directory. 
+#[derive(Debug)]
 pub struct Index {
-    file_data: HashMap<[u8; 32], FileData>, 
-    path_to_dir: Box<Path>,
+    file_data: HashMap<SHA256Hash, FileData>, 
+    path_to_dir: PathBuf,
 }
 
 impl Index {
-    pub fn new() -> Self {
-        let path_to_dir = match env::current_dir() {
-            Ok(path) => path.into_boxed_path(),
-            Err(_) => Path::new("./").to_path_buf().into_boxed_path(),
-        };
+    pub fn new(path_to_dir: PathBuf) -> Self {
         Index {
             file_data: HashMap::new(),
             path_to_dir,
@@ -149,27 +190,34 @@ impl Index {
         &self.path_to_dir
     }
 
-    fn refresh() -> Self {
-        // TODO: Scans entire directory and adds filedata file by file
-
-        Self::new()
-    }
-
-    pub fn from_file(path: &Path) -> Self {
-        let index = match Self::deserialize(&path) {
-            Ok(index) => index,
-            Err(err) => {
-                eprintln!("Could not parse index file: {}", err);
-                Index::refresh()
+    pub fn get_current_state(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        let mut data: Vec<u8> = Vec::new();
+        for (_key, value) in self.file_data.iter() {
+            for byte in value.hash {
+                data.push(byte);
             }
-        };
-
-        index
+        }
+        hasher.update(data);
+        hasher.finalize().into()
     }
 
-    // TODO: Buffer changes before writing to file to improve performance
+    pub fn from_file(path: &Path) -> io::Result<Self> {
+        Self::deserialize(&path)
+    }
+
+    pub fn get_file_data(&self, key: &[u8; 32]) -> Option<&FileData> {
+        let key = SHA256Hash {
+            value: *key,
+        };
+        self.file_data.get(&key)
+    }
+
     pub fn add_file_data(&mut self, relative_path_hash: [u8; 32], file_data: FileData) -> Result<(), EntryConflict> {
-        let res = self.file_data.insert(relative_path_hash, file_data);
+        let key = SHA256Hash {
+            value: relative_path_hash,
+        };
+        let res = self.file_data.insert(key, file_data);
         match res {
             Some(_) => Err(EntryConflict{}),
             None => Ok(())
@@ -177,11 +225,14 @@ impl Index {
     }
 
     pub fn remove_file_data(&mut self, relative_path_hash: [u8; 32]) -> Option<FileData> {
-        self.file_data.remove(&relative_path_hash)
+        let key = SHA256Hash {
+            value: relative_path_hash,
+        };
+        let return_value = self.file_data.remove(&key);
+        return_value
     }
 
-    pub fn edit_file_data() {
-
+    pub fn edit_file_data(&mut self) {
     }
 
     pub fn write_to_file(&self) -> Result<(), io::Error>{
@@ -197,8 +248,8 @@ impl Index {
         let mut bytes: Vec<u8> = Vec::new();
 
         for (hash, file_data) in self.file_data.iter() {
-            for byte in hash {
-                bytes.push(*byte);
+            for byte in hash.value {
+                bytes.push(byte);
             }
 
             for byte in file_data.serialize() {
@@ -210,7 +261,10 @@ impl Index {
     }
 
     fn deserialize(path: &Path) -> io::Result<Self> {
-        let mut index = Index::new();
+        let mut path_to_dir = path.to_path_buf();
+        path_to_dir.pop();
+        path_to_dir.pop();
+        let mut index = Index::new(path_to_dir);
 
         let bytes = fs::read(path)?;
 
@@ -234,11 +288,31 @@ impl Index {
             slice_start += 4;
             let file_data = FileData::deserialize(&bytes[slice_start..slice_start+bytes_to_read]);
 
-            index.file_data.insert(hash, file_data);
+            let _ = index.add_file_data(hash, file_data);
             slice_start += bytes_to_read;
         }
         Ok(index)
     } 
+}
+
+pub enum ChangeType {
+    Create {
+        file_hash: [u8; 32],
+    },
+    Delete,
+    Modify {
+        file_hash: [u8; 32],
+    },
+    Rename {
+        new_name: String,
+    },
+}
+
+pub struct Change {
+    pub change_type: ChangeType,
+    pub new_state: [u8; 32],
+    pub timestamp: u64,
+    pub file_path: PathBuf,
 }
 
 #[cfg(test)]
@@ -258,13 +332,14 @@ mod tests {
             }
             array
         };
+        original.set_timestamp(UNIX_EPOCH.checked_add(Duration::from_millis(5000)).unwrap());
         let clone = original.clone();
         assert_eq!(original, clone);
     }
 
     #[test]
     fn index_is_serialized() -> Result<(), io::Error> {
-        let mut index = Index::new();
+        let mut index = Index::new(PathBuf::from("./test"));
         let _ = fs::create_dir("./test");
         let _ = fs::create_dir("./test/.rdovetail");
         let mut file_handle = fs::File::create("./test/test_data.txt")?;
@@ -281,10 +356,12 @@ mod tests {
         };
         let file_data_clone = file_data.clone();
         let res = index.add_file_data(relative_path_hash, file_data);
-        assert!(res.is_none());
-        index.path_to_dir = Path::new("./test").to_owned().into_boxed_path();
+        assert!(res.is_ok());
         let _ = index.write_to_file()?;
-        let read_index = Index::from_file(Path::new("./test/.rdovetail/index"));
+        let read_index = Index::from_file(Path::new("./test/.rdovetail/index"))?;
+        let relative_path_hash = SHA256Hash {
+            value: relative_path_hash,
+        };
         let entry = read_index.file_data.get(&relative_path_hash);
         assert!(entry.is_some(), "Entry in read index does not exist.");
         assert_eq!(entry.unwrap(), &file_data_clone, "Read filedata does not match original.");
