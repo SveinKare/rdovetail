@@ -1,9 +1,9 @@
 use notify::{EventHandler, EventKind, RecursiveMode, Watcher};
-use std::env;
+use std::{env, thread};
 use std::path::Path;
 use std::error::Error;
 use std::fs::create_dir;
-use std::sync::mpsc::{Sender, Receiver, SendError};
+use std::sync::mpsc::{Sender, Receiver, SendError, channel};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
@@ -38,19 +38,21 @@ fn init_dovetail(dir: &Path) -> Result<Index, Box<dyn Error>> {
     Ok(index)
 }
 
-pub fn start(
-    tx_alpha: Sender<Message>, 
-    rx_beta: Receiver<Message>,
-    tx_beta_clone: Sender<Message>,
-    ) -> Result<(), Box<dyn Error>> { 
+pub fn start() -> Result<(Sender<Message>, Receiver<Message>), Box<dyn Error>> { 
     let path = env::current_dir()?;
+
+    // VCS -> func caller
+    let (tx_alpha, rx_alpha): (Sender<Message>, Receiver<Message>) = channel();
+
+    // ChangeNotifier AND func caller -> VCS
+    let (tx_beta, rx_beta): (Sender<Message>, Receiver<Message>) = channel();
 
     let index = init_dovetail(&path)?;
     // Check entire directory, and ensure that index is up to date
 
     let mut watcher = notify::recommended_watcher(
         ChangeNotifier {
-            tx: tx_beta_clone,
+            tx: tx_beta.clone(),
     })?;
 
     let mut vcs = VersionControl {
@@ -65,10 +67,13 @@ pub fn start(
     watcher.watch(&path, RecursiveMode::Recursive)?;
 
     println!("Started listening.");
-    loop {
-        vcs.listen();
-    }
-    Ok(())
+    thread::spawn(move || {
+        let _watcher = watcher;
+        loop {
+            vcs.listen();
+        }
+    });
+    Ok((tx_beta, rx_alpha))
 }
 
 // VCS should have some sort of data structure that can aid in determining if a file has been
@@ -83,7 +88,6 @@ struct VersionControl {
 
 impl VersionControl {
     fn send_update(&self, message: Message) -> Result<(), SendError<Message>> {
-        println!("Message sent to client.");
         self.tx_to_client.send(message)
     }
 
@@ -113,7 +117,6 @@ impl VersionControl {
                         }
                     },
                     Message::FileRemoved { path } => {
-                        println!("Removed: {:?}", path);
                         if let Some(_) = self.remove_file_data(&path) {
                             self.changes.push(Change {
                                 change_type: ChangeType::Delete,
@@ -121,16 +124,24 @@ impl VersionControl {
                                 timestamp: as_nanos_since_epoch(&SystemTime::now()),
                                 file_path: path.clone(),
                             });
-                            if let Err(err) = self.send_update(Message::FileRemoved { path }) {
+
+                            // The relative path is passed up in the system
+                            let relative_path = find_relative_path(self.index.get_path_to_dir().iter(), path.iter());
+                            if let Err(err) = self.send_update(Message::FileRemoved { path: relative_path }) {
                                 println!("Error: {:?}", err)
                                 //check_health
                             }
                         }
                     },
                     Message::FileRequest { relative_path_hash } => {
+                        // Check index for hash
+                        // Send compressed file from store
 
 
                     },
+                    Message::ExternalChange {  } => {
+                        // Implement change
+                    }
                 }
             },
             Err(err) => println!("Error: {:?}", err),
@@ -174,7 +185,7 @@ impl VersionControl {
 
             },
             ChangeType::Delete => {
-                // Find the actual file and delete it
+
                 self.remove_file_data(&change.file_path);
             },
             ChangeType::Modify { file_hash } => {

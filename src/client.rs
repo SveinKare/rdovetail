@@ -1,15 +1,21 @@
 use notify::{Result};
 use crate::common::{version_control, message::Message};
+use crate::Config;
 use core::panic;
-use std::sync::mpsc::{channel, Sender, Receiver};
+use std::io::Write;
+use std::net::TcpStream;
 
-pub fn init() -> Result<()> {
-    let (tx_to_vcs, rx_vcs): (Sender<Message>, Receiver<Message>) = channel();
-    let (tx_vcs, rx_from_vcs): (Sender<Message>, Receiver<Message>) = channel();
+pub fn init(config: &Config) -> Result<()> {
+    let res = version_control::start();
+    
+    let (tx_to_vcs, rx_from_vcs) = match res {
+        Ok((tx, rx)) => (tx, rx),
+        Err(err) => panic!("An error occurred: {:?}", err),
+    };
 
-    let res = version_control::start(tx_vcs, rx_vcs, tx_to_vcs.clone());
-    match res {
-        Ok(_) => Ok(()),
-        Err(err) => panic!("An error occurred in version_control::start(): {:?}", err),
-    }
+    let mut stream = TcpStream::connect(config.address)?;
+    let test = rx_from_vcs.recv().unwrap();
+    
+    println!("{:?}", test);
+    Ok(())
 }

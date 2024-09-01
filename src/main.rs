@@ -15,9 +15,9 @@ pub mod common {
 
 fn main() {
     let args = Args::try_parse();
-    let args = args.unwrap_or_else(|err| {
-        println!("{}", err);
-        process::exit(1);
+    let args = args.unwrap_or_else(|help_message| {
+        println!("{}", help_message); // For the info flags like help and version
+        process::exit(0);
     });
 
     let config = Config::build(args).unwrap_or_else(|_err| {
@@ -29,7 +29,7 @@ fn main() {
     if config.server_mode {
         server::init(&config);
     } else {
-        client::init();
+        client::init(&config);
     }
 }
 
