@@ -13,10 +13,14 @@ pub fn init(config: &Config) -> Result<()> {
         Ok((tx, rx)) => (tx, rx),
         Err(err) => panic!("An error occurred: {:?}", err),
     };
+    println!("Ready");
 
     let message = rx_from_vcs.recv().unwrap();
     let encoded = bincode::serialize(&message).unwrap();
-    stream.write(&encoded);
+    let message_length = encoded.len() as u64;
+    stream.write_all(&message_length.to_be_bytes())?;
+    stream.write_all(&encoded)?;
+    stream.flush()?;
 
     println!("Message sent");
     

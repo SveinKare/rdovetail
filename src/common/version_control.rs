@@ -98,7 +98,8 @@ impl VersionControl {
                     Message::FileCreated { path } => {
                         println!("Created: {:?}", path);
                         
-                        if let Ok(key) = self.add_file_data(&path) {
+                        match self.add_file_data(&path) {
+                            Ok(key) => {
                             let file_hash = self.index.get_file_data(&key).unwrap().get_hash();
                             self.changes.push(Change {
                                 change_type: ChangeType::Create {
@@ -112,9 +113,9 @@ impl VersionControl {
                                 println!("Error: {:?}", err)
                                 //check_health
                             }
-                        } else {
-                            return
-                        }
+                            },
+                            Err(err) => println!("Error: {:?}", err),
+                        };
                     },
                     Message::FileRemoved { path } => {
                         if let Some(_) = self.remove_file_data(&path) {
