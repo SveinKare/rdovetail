@@ -1,7 +1,8 @@
 use std::process;
-use std::net::{AddrParseError, SocketAddr};
+use std::net::{AddrParseError, IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::str::FromStr;
 use clap::Parser;
+use common::error::IllegalState;
 
 pub mod server;
 pub mod client;
@@ -20,16 +21,20 @@ fn main() {
         process::exit(0);
     });
 
-    let config = Config::build(args).unwrap_or_else(|_err| {
-        println!("IP-address could not be parsed.");
-        process::exit(1);
-    });
+    let config = match Config::build(args) {
+        Ok(config) => config,
+        Err(err) => {
+            println!("{}", err);
+            process::exit(1);
+        }
+    };
+
     println!("Address: {}\nServer mode: {}", config.address, config.server_mode);
 
     if config.server_mode {
         server::init(&config);
     } else {
-        client::init(&config);
+        let res = client::init(&config);
     }
 }
 
@@ -37,7 +42,7 @@ fn main() {
 #[command(version, about, long_about = None)]
 struct Args {
     /// The IP-address of the server being linked to
-    #[arg(short, long)]
+    #[arg(short, long, default_value_t = String::new())]
     ip: String,
 
     /// Indicates that the current machine should act as a server, and receive incoming connections
@@ -52,11 +57,20 @@ pub struct Config {
 }
 
 impl Config {
-    fn build(args: Args) -> Result<Config, AddrParseError> {
-        let address = SocketAddr::from_str(&args.ip)?;
+    fn build(args: Args) -> Result<Config, IllegalState> {
+        let address = match SocketAddr::from_str(&args.ip) {
+            Ok(addr) => Some(addr),
+            Err(_) => None,
+        };
+
+        if !args.server_mode && address.is_none() {
+            return Err(IllegalState::new("Invalid ip for client mode".to_string()))
+        }
+
         Ok(Config {
-            address,
+            address: address.unwrap_or(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 50010))),
             server_mode: args.server_mode,
         })
+
     }
 }
